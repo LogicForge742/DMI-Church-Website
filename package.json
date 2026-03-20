@@ -1,5 +1,8 @@
 {
   "dependencies": {
-    "mongoose": "^8.16.5"
+    "mongoose": "^8.16.5",
+    "react-icons": "^5.5.0",
+    "react-slick": "^0.31.0",
+    "slick-carousel": "^1.8.1"
   }
 }

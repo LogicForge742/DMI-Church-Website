@@ -4,24 +4,27 @@ const multer = require('multer');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config(); // Load environment variables
 const { Pool } = require('pg');
 const generateAccessToken = require('./mpesa');
 const { initiateStkPush } = require('./mpesa');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const mailchimp = require('@mailchimp/mailchimp_marketing');
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 const uploadsDir = path.join(__dirname, 'uploads');
-const stripe = require('stripe')('sk_test_51RsrPAPLkGrqoiEnxcEvS8iBg5tBWMmI1lwa1KYdyeP7wYAC9KPUybFqFMOLjbhzkEXS23CJCPBh1l7j1A5jNE4m00Ec1cCOAp');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // ✅ PostgreSQL connection
 const pool = new Pool({
-  user: 'postgres', // 
-  host: 'localhost',
-  database: 'dmi',
-  password: 'your_secure_password',
-  port: 5432,
+  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  database: process.env.DB_NAME || 'dmi',
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT || 5432,
 });
 
 const {
@@ -35,13 +38,30 @@ const {
 pool.connect()
   .then(() => console.log('✅ Connected to PostgreSQL'))
   .catch(err => console.error('❌ PostgreSQL connection error:', err));
-const JWT_SECRET = 'your_super_secret_key';
+// 🔒 JWT secret — MUST be set in .env (crash early if missing)
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('❌ FATAL: JWT_SECRET is not set in .env. Server cannot start.');
+  process.exit(1);
+}
+
+// 🔒 Rate limiters
+const donateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,
+  message: { error: 'Too many donation requests. Please try again later.' },
+});
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many login attempts. Please try again later.' },
+});
+
 // ✅ Middleware
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(uploadsDir));
-bcrypt.hash('secret2025', 10).then(console.log);
 
 // ✅ Ensure uploads directory exists
 if (!fs.existsSync(uploadsDir)) {
@@ -53,7 +73,7 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
 });
-const upload = multer({ storage });
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } }); // 10 MB max
 
 // ✅ Simple logger
 app.use((req, res, next) => {
@@ -65,6 +85,93 @@ app.use((req, res, next) => {
 app.get('/api/test', (req, res) => {
   res.json({ message: 'Backend is working!' });
 });
+
+// 📌 Contact Form Route
+app.post('/api/contact', async (req, res) => {
+  const { name, email, subject, message } = req.body;
+  if (!name || !email || !subject || !message) {
+    return res.status(400).json({ error: 'All fields are required.' });
+  }
+
+  // Basic email format check
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ error: 'Invalid email address.' });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO contact_messages (name, email, subject, message, created_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [name, email, subject, message]
+    );
+    console.log(`📬 Contact message from ${name} <${email}> — ${subject}`);
+    res.json({ success: true, message: 'Message received. Thank you!' });
+  } catch (err) {
+    console.error('Contact form error:', err);
+    res.status(500).json({ error: 'Could not save your message. Please try again.' });
+  }
+});
+
+// 📌 Newsletter Subscription Route
+// Mailchimp setup (gracefully skips if not configured)
+const mailchimpReady = process.env.MAILCHIMP_API_KEY &&
+  process.env.MAILCHIMP_API_KEY !== 'your-mailchimp-api-key-here';
+
+if (mailchimpReady) {
+  mailchimp.setConfig({
+    apiKey: process.env.MAILCHIMP_API_KEY,
+    server: process.env.MAILCHIMP_SERVER_PREFIX || 'us1',
+  });
+  console.log('📰 Mailchimp integration enabled');
+} else {
+  console.log('⚠️  Mailchimp not configured — newsletter subscribers saved locally only');
+}
+
+app.post('/api/newsletter', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required.' });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ error: 'Invalid email address.' });
+  }
+
+  try {
+    // Save to local database
+    await pool.query(
+      `INSERT INTO newsletter_subscribers (email, subscribed_at)
+       VALUES ($1, NOW())
+       ON CONFLICT (email) DO NOTHING`,
+      [email]
+    );
+
+    // Sync to Mailchimp if configured
+    if (mailchimpReady) {
+      try {
+        await mailchimp.lists.addListMember(process.env.MAILCHIMP_AUDIENCE_ID, {
+          email_address: email,
+          status: 'subscribed',
+        });
+      } catch (mcErr) {
+        // Ignore "already subscribed" errors (status 400, title "Member Exists")
+        if (mcErr.status !== 400) {
+          console.error('Mailchimp sync error:', mcErr.message);
+        }
+      }
+    }
+
+    console.log(`📰 Newsletter signup: ${email}`);
+    res.json({ success: true, message: 'You are now subscribed! God bless you.' });
+  } catch (err) {
+    console.error('Newsletter error:', err);
+    res.status(500).json({ error: 'Could not subscribe. Please try again.' });
+  }
+});
+
+
 
 // 📌 Event Routes
 app.post('/api/events', async (req, res) => {
@@ -238,10 +345,8 @@ app.get('/api/categories', (req, res) => {
 // BLOG ROUTES
 // =======================
 
-// Create blog (Admin only)
-app.post('/api/blogs', async (req, res) => {
-  const auth = req.headers.authorization;
-  if (auth !== 'Bearer admin-token') return res.status(403).json({ error: 'Unauthorized' });
+// Create blog (Admin only — protected by JWT)
+app.post('/api/blogs', authenticateAdmin, async (req, res) => {
 
   const { title, content, image, author, tags } = req.body;
   try {
@@ -280,10 +385,8 @@ app.get('/api/blogs/:id', async (req, res) => {
   }
 });
 
-// Update blog (Admin only)
-app.put('/api/blogs/:id', async (req, res) => {
-  const auth = req.headers.authorization;
-  if (auth !== 'Bearer admin-token') return res.status(403).json({ error: 'Unauthorized' });
+// Update blog (Admin only — protected by JWT)
+app.put('/api/blogs/:id', authenticateAdmin, async (req, res) => {
 
   const { id } = req.params;
   const { title, content, image, author, tags } = req.body;
@@ -300,10 +403,8 @@ app.put('/api/blogs/:id', async (req, res) => {
   }
 });
 
-// Delete blog (Admin only)
-app.delete('/api/blogs/:id', async (req, res) => {
-  const auth = req.headers.authorization;
-  if (auth !== 'Bearer admin-token') return res.status(403).json({ error: 'Unauthorized' });
+// Delete blog (Admin only — protected by JWT)
+app.delete('/api/blogs/:id', authenticateAdmin, async (req, res) => {
 
   const { id } = req.params;
   try {
@@ -336,7 +437,7 @@ async function getAccessToken() {
 }
 
 // 2. Universal Donation Endpoint
-app.post('/api/donate', async (req, res) => {
+app.post('/api/donate', donateLimiter, async (req, res) => {
   const { phone, amount } = req.body;
 
   if (!phone || !amount) {
@@ -438,7 +539,7 @@ app.post('/admin/register', async (req, res) => {
 });
 
 // =================== Admin Login ===================
-app.post('/admin/login', async (req, res) => {
+app.post('/admin/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body;
   try {
     const result = await pool.query('SELECT * FROM admins WHERE email = $1', [email]);
